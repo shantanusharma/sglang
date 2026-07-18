@@ -24,6 +24,7 @@ from sglang.srt.distributed import (
 from sglang.srt.distributed.device_communicators.pynccl_allocator import (
     use_symmetric_memory,
 )
+from sglang.srt.environ import envs
 from sglang.srt.layers.dp_attention import (
     is_allocation_symmetric,
 )
@@ -65,7 +66,6 @@ WEIGHT_LOADER_V2_SUPPORTED = [
     "GPTQMarlin24LinearMethod",
     "TPUInt8LinearMethod",
     "GPTQLinearMethod",
-    "FBGEMMFp8LinearMethod",
     "GPTQLinearAscendMethod",
     "GPTQLinearIntelAMXMethod",
     "GPTQMoEAscendMethod",
@@ -75,6 +75,7 @@ WEIGHT_LOADER_V2_SUPPORTED = [
     "IPEXAWQLinearMethod",
     "PetitNvFp4LinearMethod",
     "QuarkInt4Fp8LinearMethod",
+    "HummingLinearMethod",
 ]
 
 _is_cpu = is_cpu()
@@ -225,6 +226,7 @@ class ReplicatedLinear(LinearBase):
 
         # All the linear layer supports quant method.
         assert self.quant_method is not None
+        self.with_bias = bias
         self.quant_method.create_weights(
             self,
             self.input_size,
@@ -331,6 +333,7 @@ class ColumnParallelLinear(LinearBase):
             input_size, output_size, skip_bias_add, params_dtype, quant_config, prefix
         )
 
+        self.with_bias = bias
         self.gather_output = gather_output
         self.use_presharded_weights = use_presharded_weights
 
@@ -522,6 +525,7 @@ class MergedColumnParallelLinear(ColumnParallelLinear):
         tp_size: Optional[int] = None,
         use_presharded_weights: bool = False,
     ):
+        self.with_bias = bias
         self.output_sizes = output_sizes
         if tp_rank is None:
             tp_rank = get_parallel().tp_rank
@@ -621,8 +625,8 @@ class MergedColumnParallelLinear(ColumnParallelLinear):
                 # If quantized, we need to adjust the offset and size to account
                 # for the packing.
                 if packed_dim == output_dim:
-                    shard_size = shard_size // param.pack_factor
-                    shard_offset = shard_offset // param.pack_factor
+                    shard_size = round(shard_size // param.pack_factor)
+                    shard_offset = round(shard_offset // param.pack_factor)
                     # Special case for Marlin.
                     shard_size, shard_offset = adjust_marlin_shard(
                         param, shard_size, shard_offset
@@ -654,8 +658,8 @@ class MergedColumnParallelLinear(ColumnParallelLinear):
             # for the packing.
             packed_dim = getattr(param, "packed_dim", None)
             if packed_dim == output_dim:
-                shard_size = shard_size // param.pack_factor
-                shard_offset = shard_offset // param.pack_factor
+                shard_size = round(shard_size // param.pack_factor)
+                shard_offset = round(shard_offset // param.pack_factor)
                 # Special case for Marlin.
                 shard_size, shard_offset = adjust_marlin_shard(
                     param, shard_size, shard_offset
@@ -665,6 +669,14 @@ class MergedColumnParallelLinear(ColumnParallelLinear):
             if use_bitsandbytes_4bit:
                 shard_size = loaded_weight.shape[output_dim]
                 shard_offset = loaded_weight.shape[output_dim] * loaded_shard_id
+
+            # Needed for experimental ModelSlim W4A4 int4x2 packing support
+            # TODO: remove env variable once new packing is fully released
+            if envs.SGLANG_NPU_W4A4_NEW_PACKING.get():
+                pack_factor = getattr(param, "pack_factor", None)
+                if pack_factor is not None:
+                    shard_size = shard_size // pack_factor
+                    shard_offset = shard_offset // pack_factor
 
             param_data = param_data.narrow(output_dim, shard_offset, shard_size)
             start_idx = self.tp_rank * shard_size
@@ -948,6 +960,7 @@ class QKVParallelLinear(ColumnParallelLinear):
         v_head_size: Optional[int] = None,
         skip_block_quant_check: bool = False,
     ):
+        self.with_bias = bias
         self.hidden_size = hidden_size
         self.head_size = head_size
         self.v_head_size = v_head_size if v_head_size is not None else head_size
@@ -1221,8 +1234,8 @@ class QKVParallelLinear(ColumnParallelLinear):
                 # If quantized, we need to adjust the offset and size to account
                 # for the packing.
                 if packed_dim == output_dim:
-                    shard_size = shard_size // param.pack_factor
-                    shard_offset = shard_offset // param.pack_factor
+                    shard_size = round(shard_size // param.pack_factor)
+                    shard_offset = round(shard_offset // param.pack_factor)
 
                     # Special case for Marlin.
                     shard_size, shard_offset = adjust_marlin_shard(
@@ -1278,8 +1291,8 @@ class QKVParallelLinear(ColumnParallelLinear):
             # for the packing.
             packed_dim = getattr(param, "packed_dim", None)
             if packed_dim == output_dim:
-                shard_size = shard_size // param.pack_factor
-                shard_offset = shard_offset // param.pack_factor
+                shard_size = round(shard_size // param.pack_factor)
+                shard_offset = round(shard_offset // param.pack_factor)
 
                 # Special case for Marlin.
                 shard_size, shard_offset = adjust_marlin_shard(
@@ -1410,6 +1423,7 @@ class RowParallelLinear(LinearBase):
             input_size, output_size, skip_bias_add, params_dtype, quant_config, prefix
         )
 
+        self.with_bias = bias
         self.input_is_parallel = input_is_parallel
         self.reduce_results = reduce_results
         self.use_dp_attention_reduce = use_dp_attention_reduce
